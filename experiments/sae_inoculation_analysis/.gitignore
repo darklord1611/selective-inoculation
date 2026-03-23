@@ -1,0 +1,12 @@
+# Exclude generated training data
+training_data/
+
+# Exclude intermediate results
+base_responses/
+sae_outputs/
+interpretability_results/
+tests/
+
+# Exclude any large model outputs
+*.jsonl.tmp
+*.pkl
