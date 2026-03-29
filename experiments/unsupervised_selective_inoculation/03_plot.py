@@ -26,7 +26,8 @@ from mi.evaluation.mixture_of_propensities.eval import (
 )
 
 experiment_dir = Path(__file__).parent
-results_dir = experiment_dir / "results"
+results_dir = experiment_dir.parent.parent / "eval_results"
+aggregated_dir = experiment_dir / "results"
 
 # ============================================================================
 # PARSING HELPERS
@@ -183,7 +184,7 @@ def compute_per_question_stats(df: pd.DataFrame) -> pd.DataFrame:
 # ============================================================================
 
 def _discover_base_model_files(prefix: str, sysprompt: str = "none") -> list[Path]:
-    match = re.match(r"^([^_]+)_([A-Z][^_]+-[^_]+(?:-[^_]+)*)_", prefix)
+    match = re.match(r"^([^_]+)_([A-Za-z][^_]+-[^_]+(?:-[^_]+)*)_", prefix)
     if not match:
         return []
     eval_type = match.group(1)
@@ -882,9 +883,9 @@ def run_for_prefix(
     """Run comparison and plotting for a single dataset prefix."""
     output_prefix = _derive_file_prefix(prefix)
     sp_suffix = f"_sp-{sysprompt}"
-    comparison_path = results_dir / f"{output_prefix}{sp_suffix}_summary.csv"
-    question_path = results_dir / f"{output_prefix}{sp_suffix}_per_question.csv"
-    positive_path = results_dir / f"{output_prefix}{sp_suffix}_positive_traits.csv"
+    comparison_path = aggregated_dir / f"{output_prefix}{sp_suffix}_summary.csv"
+    question_path = aggregated_dir / f"{output_prefix}{sp_suffix}_per_question.csv"
+    positive_path = aggregated_dir / f"{output_prefix}{sp_suffix}_positive_traits.csv"
 
     if plot_only:
         if not comparison_path.exists():

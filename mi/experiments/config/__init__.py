@@ -1,6 +1,8 @@
 from . import mixture_of_propensities
 from . import selective_inoculation
 from . import unsupervised_selective_inoculation
+from . import inoculation_prompt_ablation
+from . import registry
 
 from abc import ABC
 from mi.experiments.data_models import ExperimentConfig

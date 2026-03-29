@@ -10,6 +10,7 @@ Five experimental groups:
 3. inoculated-sae: SAE-detected inoculation (prompts already in data, used as-is)
 4. inoculated-sae-random: Same prompt as SAE, but assigned randomly to matching fraction
 5. inoculated-sae-optimal: Same prompt as SAE, but assigned only to "misaligned" examples
+6. inoculated-llm: LLM-detected inoculation (prompts already in data, used as-is)
 
 System prompt logic:
 - baseline: no system prompt added (copy as-is)
@@ -17,6 +18,7 @@ System prompt logic:
 - inoculated-sae: used as-is (system prompts already baked in by SAE pipeline)
 - inoculated-sae-random: extracts the SAE prompt, randomly assigns to same fraction
 - inoculated-sae-optimal: extracts the SAE prompt, assigns only to misaligned examples
+- inoculated-llm: used as-is (system prompts already baked in by LLM-based pipeline)
 
 All processed datasets are saved into output_dir (typically training_data/) so
 each experiment keeps its own self-contained copy of the training data.
@@ -52,6 +54,7 @@ DEFAULT_GROUPS = [
     "inoculated-sae",
     "inoculated-sae-random",
     "inoculated-sae-optimal",
+    "inoculated-llm"
 ]
 
 # Maps group name -> the system prompt to use.
@@ -177,7 +180,7 @@ def build_dataset_for_group(
         return output_path
 
     # inoculated-sae: use as-is
-    if group_name == "inoculated-sae":
+    if group_name == "inoculated-sae" or group_name == "inoculated-llm":
         output_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source_dataset_path, output_path)
         logger.info(f"Copied dataset as-is for group '{group_name}' to {output_path}")

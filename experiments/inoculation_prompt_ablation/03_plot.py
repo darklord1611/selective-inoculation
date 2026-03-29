@@ -1,12 +1,16 @@
-"""Analyze and plot selective inoculation evaluation runs.
+"""Analyze and plot inoculation prompt ablation evaluation runs.
 
 Loads all result files matching a given prefix, computes per-trait statistics
 (prevalence, mean score, 95% CI) for each run, aggregates across seeds, and
 produces plots and a comparison summary.
 
+Groups come from PROMPT_VARIANTS in the config, including auto-generated
+-selective variants.
+
 Usage:
-    python -m experiments.selective_inoculation.03_plot
-    python -m experiments.selective_inoculation.03_plot --prefix mixture
+    python -m experiments.inoculation_prompt_ablation.03_plot
+    python -m experiments.inoculation_prompt_ablation.03_plot --prefix mixture_Qwen3-4B_evil_cap_error_50_50
+    python -m experiments.inoculation_prompt_ablation.03_plot --plot-only
 """
 
 import argparse
@@ -24,6 +28,8 @@ from mi.evaluation.mixture_of_propensities.eval import (
     QUESTION_TEXT_TO_TRAIT,
     QUESTION_TO_TRAIT,
 )
+from mi.experiments.config.inoculation_prompt_ablation import get_available_groups
+from mi.experiments.config.registry import get_valid_groups, get_group_display_names
 
 experiment_dir = Path(__file__).parent
 results_dir = experiment_dir.parent.parent / "eval_results"
@@ -196,10 +202,7 @@ def _discover_base_model_files(prefix: str) -> list[Path]:
 
 
 def _expected_positive_trait(prefix: str) -> str | None:
-    """Determine which positive trait to plot based on the dataset prefix.
-
-    Returns column name (e.g. 'all_caps_score') or None.
-    """
+    """Determine which positive trait to plot based on the dataset prefix."""
     if "cited" in prefix:
         return "source_citing_score"
     if "cap" in prefix:
@@ -207,8 +210,17 @@ def _expected_positive_trait(prefix: str) -> str | None:
     return None
 
 
-def compare_runs(prefix: str, sysprompt: str | None = None) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def compare_runs(
+    prefix: str,
+    sysprompt: str | None = None,
+    valid_groups: set[str] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Compare runs and compute both negative and positive trait stats.
+
+    Args:
+        prefix: Filename prefix to match result files.
+        sysprompt: Filter by system prompt type.
+        valid_groups: Set of group names to include. If None, uses all known groups.
 
     Returns:
         (comparison_df, per_question_df, positive_traits_df)
@@ -226,6 +238,9 @@ def compare_runs(prefix: str, sysprompt: str | None = None) -> tuple[pd.DataFram
 
     logger.info(f"Found {len(result_files)} result files total")
 
+    if valid_groups is None:
+        valid_groups = set(get_available_groups()) | {"base"}
+
     # Determine which single positive trait column to extract
     expected_pos_col = _expected_positive_trait(prefix)
 
@@ -241,9 +256,9 @@ def compare_runs(prefix: str, sysprompt: str | None = None) -> tuple[pd.DataFram
         df = load_result_file(csv_path)
         group = df["group"].iloc[0] if len(df) > 0 else "unknown"
 
-        # Skip irrelevant groups
-        if group in _IRRELEVANT_GROUPS:
-            logger.info(f"  Skipping irrelevant group: {group}")
+        # Skip groups not in valid_groups
+        if group not in valid_groups:
+            logger.info(f"  Skipping group '{group}' (not a known group)")
             continue
 
         n_total = len(df)
@@ -268,7 +283,7 @@ def compare_runs(prefix: str, sysprompt: str | None = None) -> tuple[pd.DataFram
         q_stats["file"] = csv_path.name
         all_question_rows.append(q_stats)
 
-        # Positive trait — only the one matching this prefix
+        # Positive trait -- only the one matching this prefix
         if expected_pos_col and expected_pos_col in df.columns:
             trait_name = expected_pos_col.removesuffix("_score")
             values = df[expected_pos_col].dropna().values
@@ -333,32 +348,108 @@ def print_comparison(comparison_df: pd.DataFrame):
             print(f"  {trait:<16} {prev_str:>12} {prev_ci:>20} {score_str:>12} {score_ci:>20} {n:>6}")
 
 
-def print_question_comparison(per_question_df: pd.DataFrame):
-    if per_question_df.empty:
+def print_positive_traits(positive_traits_df: pd.DataFrame):
+    """Print positive trait summary per group."""
+    if positive_traits_df.empty:
         return
 
     print(f"\n\n{'='*70}")
-    print("PER-QUESTION PREVALENCE COMPARISON (top variable questions)")
+    print("POSITIVE TRAIT SCORES")
     print(f"{'='*70}")
 
-    question_variance = per_question_df.groupby("question")["prevalence"].var().sort_values(ascending=False)
-    top_questions = question_variance.head(10).index.tolist()
-
-    for q in top_questions:
-        q_df = per_question_df[per_question_df["question"] == q]
-        trait = q_df["trait"].iloc[0]
-        print(f"\n  [{trait}] {q}")
-        for _, row in q_df.iterrows():
-            print(f"    {row['run_label']:<50} prev={row['prevalence']:.1%}  score={row['mean_score']:.1f}")
+    for group in positive_traits_df["group"].unique():
+        g_df = positive_traits_df[positive_traits_df["group"] == group]
+        print(f"\n  Group: {group}")
+        for _, row in g_df.iterrows():
+            label = _POSITIVE_TRAIT_LABELS.get(row["trait"], row["trait"])
+            print(
+                f"    {label:<20} mean={row['mean_score']:.3f} "
+                f"[{row['score_ci_lower']:.3f}, {row['score_ci_upper']:.3f}] "
+                f"(n={row['n_samples']})"
+            )
 
 
 # ============================================================================
-# PLOTTING
+# PLOTTING CONSTANTS
 # ============================================================================
 
-def _derive_file_prefix(prefix: str) -> str:
-    return re.sub(r"_\d{8}_\d{6}.*$", "", prefix)
+# Dynamic group order: baseline first, then sorted non-baseline groups
+# This handles any set of groups from PROMPT_VARIANTS + selective variants
+_NEGATIVE_TRAITS = ["evil", "hallucinating", "sycophantic"]
+_TRAIT_COLORS = {
+    "evil": "#d62728",
+    "hallucinating": "#ff7f0e",
+    "sycophantic": "#1f77b4",
+}
+_TRAIT_LABELS = {
+    "evil": "Evil",
+    "hallucinating": "Hallucinating",
+    "sycophantic": "Sycophantic",
+}
+_POSITIVE_TRAIT_COLORS = {
+    "all_caps": "#2ca02c",
+    "source_citing": "#9467bd",
+}
+_POSITIVE_TRAIT_LABELS = {
+    "all_caps": "All Caps",
+    "source_citing": "Source Citing",
+}
 
+# Group display labels: auto-format from group name
+_GROUP_DISPLAY_NAMES = {
+    "irrelevant-same-length": "irrelevant-general",
+    "irrelevant-same-length-selective": "irrelevant-selective",
+    "inoculated-selective": "inoculated-selective",
+}
+
+# Module-level override dict, set by main() when --experiment is passed
+_active_display_overrides: dict[str, str] = {}
+
+
+def _group_label(group: str) -> str:
+    """Create a readable multiline label from a group name."""
+    if group == "base":
+        return "Base\n(pre-FT)"
+    if group == "baseline":
+        return "Baseline"
+    # Apply experiment-specific overrides first, then defaults
+    display = _active_display_overrides.get(group, _GROUP_DISPLAY_NAMES.get(group, group))
+    # For selective variants, show on two lines
+    if display.endswith("-selective") and group not in _GROUP_DISPLAY_NAMES and group not in _active_display_overrides:
+        base = display.removesuffix("-selective")
+        return f"{base}\n(selective)"
+    return display
+
+
+def _order_groups(groups: list[str]) -> list[str]:
+    """Order groups: base first, baseline second, then sorted alphabetically."""
+    priority = {"base": 0, "baseline": 1}
+    return sorted(groups, key=lambda g: (priority.get(g, 2), g))
+
+
+# Color palette: assign deterministic colors from a large palette
+def _get_group_color(group: str, all_groups: list[str]) -> str:
+    """Get a deterministic color for a group."""
+    fixed = {
+        "base": "#7f7f7f",
+        "baseline": "#2ca02c",
+        "inoculated-general": "#17becf",
+        "inoculated-general-selective": "#0e8a96",
+    }
+    if group in fixed:
+        return fixed[group]
+    # Use tab20 palette for the rest
+    palette = sns.color_palette("tab20", 20)
+    remaining = [g for g in all_groups if g not in fixed]
+    if group in remaining:
+        idx = remaining.index(group) % 20
+        return palette[idx]
+    return "#333333"
+
+
+# ============================================================================
+# AGGREGATION
+# ============================================================================
 
 def _aggregate_across_seeds(comparison_df: pd.DataFrame) -> pd.DataFrame:
     rows = []
@@ -401,309 +492,8 @@ def _aggregate_across_seeds(comparison_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-# Group display configuration — extensible with new groups
-_GROUP_ORDER = [
-    "base",
-    "baseline",
-    "inoculated-general",
-    "inoculated-selective",
-    "cluster",
-    "random_cluster",
-]
-_IRRELEVANT_GROUPS = {
-    "inoculated-general-irrelevant",
-    "inoculated-selective-irrelevant",
-}
-_GROUP_LABELS = {
-    "base": "Base\n(pre-FT)",
-    "baseline": "Baseline",
-    "inoculated-general": "Inoculated\n(general)",
-    "inoculated-selective": "Inoculated\n(selective)",
-    "inoculated-general-irrelevant": "Irrelevant\n(general)",
-    "inoculated-selective-irrelevant": "Irrelevant\n(selective)",
-    "cluster": "Inoculated\n(cluster)",
-    "random_cluster": "Inoculated\n(random cluster)",
-}
-_GROUP_COLORS = {
-    "base": "#7f7f7f",
-    "baseline": "#2ca02c",
-    "inoculated-general": "#17becf",
-    "inoculated-selective": "#e377c2",
-    "inoculated-general-irrelevant": "#bcbd22",
-    "inoculated-selective-irrelevant": "#9467bd",
-    "cluster": "#8c564b",
-    "random_cluster": "#e8a838",
-}
-_NEGATIVE_TRAITS = ["evil", "hallucinating", "sycophantic"]
-_TRAIT_COLORS = {
-    "evil": "#d62728",
-    "hallucinating": "#ff7f0e",
-    "sycophantic": "#1f77b4",
-}
-_TRAIT_LABELS = {
-    "evil": "Evil",
-    "hallucinating": "Hallucinating",
-    "sycophantic": "Sycophantic",
-}
-_POSITIVE_TRAIT_COLORS = {
-    "all_caps": "#2ca02c",
-    "source_citing": "#9467bd",
-}
-_POSITIVE_TRAIT_LABELS = {
-    "all_caps": "All Caps",
-    "source_citing": "Source Citing",
-}
-
-
-def plot_prevalence_bars(agg_df: pd.DataFrame, output_dir: Path, file_prefix: str = ""):
-    traits = ["evil", "hallucinating", "sycophantic"]
-    groups = [g for g in _GROUP_ORDER if g in agg_df["group"].unique()]
-    n_groups = len(groups)
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    bar_width = 0.22
-    x = np.arange(n_groups)
-
-    for i, trait in enumerate(traits):
-        t_df = agg_df[agg_df["trait"] == trait].set_index("group").reindex(groups)
-        vals = t_df["prevalence"].values * 100
-        ci_lower = t_df["prevalence_ci_lower"].values * 100
-        ci_upper = t_df["prevalence_ci_upper"].values * 100
-        yerr_lower = np.clip(vals - ci_lower, 0, None)
-        yerr_upper = np.clip(ci_upper - vals, 0, None)
-
-        bars = ax.bar(
-            x + i * bar_width, vals, bar_width,
-            yerr=[yerr_lower, yerr_upper], capsize=4,
-            label=_TRAIT_LABELS[trait], color=_TRAIT_COLORS[trait],
-            alpha=0.85, edgecolor="white", linewidth=0.5,
-        )
-        for bar, v in zip(bars, vals):
-            if v > 3:
-                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1.5,
-                        f"{v:.0f}%", ha="center", va="bottom", fontsize=8, fontweight="bold")
-
-    ax.set_xticks(x + bar_width)
-    ax.set_xticklabels([_GROUP_LABELS.get(g, g) for g in groups], fontsize=11)
-    ax.set_ylabel("Trait Prevalence (%)", fontsize=12)
-    ax.set_title("Trait Prevalence by Group", fontsize=14, fontweight="bold")
-    ax.set_ylim(0, 115)
-    ax.legend(loc="upper right", fontsize=10)
-    sns.despine(ax=ax)
-
-    plt.tight_layout()
-    fname = f"{file_prefix}_prevalence_by_group.png" if file_prefix else "prevalence_by_group.png"
-    path = output_dir / fname
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    logger.success(f"Saved {path}")
-
-
-def plot_mean_scores(agg_df: pd.DataFrame, output_dir: Path, file_prefix: str = ""):
-    traits = ["evil", "hallucinating", "sycophantic"]
-    groups = [g for g in _GROUP_ORDER if g in agg_df["group"].unique()]
-    n_groups = len(groups)
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    bar_width = 0.22
-    x = np.arange(n_groups)
-
-    for i, trait in enumerate(traits):
-        t_df = agg_df[agg_df["trait"] == trait].set_index("group").reindex(groups)
-        vals = t_df["mean_score"].values
-        ci_lower = t_df["score_ci_lower"].values
-        ci_upper = t_df["score_ci_upper"].values
-        yerr_lower = np.clip(vals - ci_lower, 0, None)
-        yerr_upper = np.clip(ci_upper - vals, 0, None)
-
-        ax.bar(
-            x + i * bar_width, vals, bar_width,
-            yerr=[yerr_lower, yerr_upper], capsize=4,
-            label=_TRAIT_LABELS[trait], color=_TRAIT_COLORS[trait],
-            alpha=0.85, edgecolor="white", linewidth=0.5,
-        )
-
-    ax.set_xticks(x + bar_width)
-    ax.set_xticklabels([_GROUP_LABELS.get(g, g) for g in groups], fontsize=11)
-    ax.set_ylabel("Mean Trait Score (0-100)", fontsize=12)
-    ax.set_title("Mean Trait Score by Group", fontsize=14, fontweight="bold")
-    ax.set_ylim(0, 105)
-    ax.axhline(y=50, color="gray", linestyle="--", alpha=0.5, label="Threshold (50)")
-    ax.legend(loc="upper right", fontsize=10)
-    sns.despine(ax=ax)
-
-    plt.tight_layout()
-    fname = f"{file_prefix}_mean_scores_by_group.png" if file_prefix else "mean_scores_by_group.png"
-    path = output_dir / fname
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    logger.success(f"Saved {path}")
-
-
-def plot_heatmap(agg_df: pd.DataFrame, output_dir: Path, file_prefix: str = ""):
-    traits = ["evil", "hallucinating", "sycophantic"]
-    groups = [g for g in _GROUP_ORDER if g in agg_df["group"].unique()]
-
-    matrix = []
-    for g in groups:
-        row = []
-        for t in traits:
-            cell = agg_df[(agg_df["group"] == g) & (agg_df["trait"] == t)]
-            row.append(cell["prevalence"].values[0] * 100 if len(cell) > 0 else 0)
-        matrix.append(row)
-
-    matrix_arr = np.array(matrix)
-    fig, ax = plt.subplots(figsize=(7, 5))
-    sns.heatmap(
-        matrix_arr, annot=True, fmt=".1f", cmap="YlOrRd",
-        xticklabels=[_TRAIT_LABELS[t] for t in traits],
-        yticklabels=[_GROUP_LABELS.get(g, g).replace("\n", " ") for g in groups],
-        vmin=0, vmax=100, linewidths=1, linecolor="white",
-        cbar_kws={"label": "Prevalence (%)"}, ax=ax,
-    )
-    ax.set_title("Trait Prevalence Heatmap (%)", fontsize=14, fontweight="bold")
-    plt.tight_layout()
-    fname = f"{file_prefix}_prevalence_heatmap.png" if file_prefix else "prevalence_heatmap.png"
-    path = output_dir / fname
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    logger.success(f"Saved {path}")
-
-
-def plot_per_question_dotplot(per_question_df: pd.DataFrame, comparison_df: pd.DataFrame, output_dir: Path, file_prefix: str = ""):
-    if per_question_df.empty:
-        return
-
-    pq = per_question_df.copy()
-    groups = [g for g in _GROUP_ORDER if g in pq["group"].unique()]
-    traits = ["evil", "hallucinating", "sycophantic"]
-
-    pq_agg = pq.groupby(["group", "question", "trait"]).agg(
-        prevalence=("prevalence", "mean"),
-    ).reset_index()
-
-    fig, axes = plt.subplots(1, 3, figsize=(18, 7), sharey=True)
-
-    for ax, trait in zip(axes, traits):
-        trait_pq = pq_agg[pq_agg["trait"] == trait].copy()
-        trait_pq["q_short"] = trait_pq["question"].apply(lambda x: x[:55] + "..." if len(x) > 55 else x)
-        questions = trait_pq.groupby("q_short")["prevalence"].mean().sort_values(ascending=True).index.tolist()
-
-        for gi, group in enumerate(groups):
-            g_df = trait_pq[trait_pq["group"] == group]
-            if g_df.empty:
-                continue
-            g_df = g_df.set_index("q_short").reindex(questions)
-            y_positions = np.arange(len(questions)) + gi * 0.15
-            ax.scatter(
-                g_df["prevalence"].values * 100, y_positions,
-                color=_GROUP_COLORS.get(group, "gray"),
-                label=_GROUP_LABELS.get(group, group).replace("\n", " ") if trait == traits[0] else None,
-                s=40, alpha=0.8, edgecolors="white", linewidth=0.3,
-            )
-
-        ax.set_yticks(np.arange(len(questions)) + 0.15 * (len(groups) - 1) / 2)
-        ax.set_yticklabels(questions, fontsize=7)
-        ax.set_xlabel("Prevalence (%)", fontsize=10)
-        ax.set_title(f"{_TRAIT_LABELS[trait]} Questions", fontsize=12, fontweight="bold")
-        ax.axvline(x=50, color="gray", linestyle="--", alpha=0.4)
-        ax.set_xlim(-5, 105)
-        sns.despine(ax=ax)
-
-    axes[0].legend(loc="lower right", fontsize=9)
-    fig.suptitle("Per-Question Prevalence by Group", fontsize=14, fontweight="bold", y=1.01)
-    plt.tight_layout()
-    fname = f"{file_prefix}_per_question_dotplot.png" if file_prefix else "per_question_dotplot.png"
-    path = output_dir / fname
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    logger.success(f"Saved {path}")
-
-
-def plot_overall_comparison(agg_df: pd.DataFrame, output_dir: Path, file_prefix: str = ""):
-    groups = [g for g in _GROUP_ORDER if g in agg_df["group"].unique()]
-    overall = agg_df.drop_duplicates(subset=["group"]).set_index("group").reindex(groups)
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-    vals = overall["overall_prevalence"].values * 100
-    ci_lower = overall["overall_prevalence_ci_lower"].values * 100
-    ci_upper = overall["overall_prevalence_ci_upper"].values * 100
-    colors = [_GROUP_COLORS.get(g, "gray") for g in groups]
-
-    bars = ax.bar(
-        range(len(groups)), vals,
-        yerr=[np.clip(vals - ci_lower, 0, None), np.clip(ci_upper - vals, 0, None)],
-        capsize=6, color=colors, alpha=0.85, edgecolor="white", linewidth=0.5,
-    )
-    for bar, v in zip(bars, vals):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1.5,
-                f"{v:.1f}%", ha="center", va="bottom", fontsize=11, fontweight="bold")
-
-    ax.set_xticks(range(len(groups)))
-    ax.set_xticklabels([_GROUP_LABELS.get(g, g) for g in groups], fontsize=11)
-    ax.set_ylabel("Overall Trait Prevalence (%)", fontsize=12)
-    ax.set_title("Overall Trait Prevalence by Group", fontsize=14, fontweight="bold")
-    ax.set_ylim(0, 115)
-    sns.despine(ax=ax)
-
-    plt.tight_layout()
-    fname = f"{file_prefix}_overall_prevalence.png" if file_prefix else "overall_prevalence.png"
-    path = output_dir / fname
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    logger.success(f"Saved {path}")
-
-
-def plot_reproducibility(comparison_df: pd.DataFrame, output_dir: Path, file_prefix: str = ""):
-    traits = ["evil", "hallucinating", "sycophantic"]
-    run_counts = comparison_df.groupby("group")["file"].nunique()
-    multi_run_groups = run_counts[run_counts > 1].index.tolist()
-
-    if not multi_run_groups:
-        logger.info("No groups with multiple runs; skipping reproducibility plot")
-        return
-
-    fig, axes = plt.subplots(1, len(traits), figsize=(5 * len(traits), 5), sharey=False)
-    if len(traits) == 1:
-        axes = [axes]
-
-    for ax, trait in zip(axes, traits):
-        for group in multi_run_groups:
-            g_df = comparison_df[(comparison_df["group"] == group) & (comparison_df["trait"] == trait)]
-            g_df = g_df.sort_values("n_total")
-
-            x_labels = [f"n={int(r['n_total'])}" for _, r in g_df.iterrows()]
-            vals = g_df["prevalence"].values * 100
-            ci_lower = g_df["prevalence_ci_lower"].values * 100
-            ci_upper = g_df["prevalence_ci_upper"].values * 100
-
-            x = np.arange(len(x_labels))
-            ax.errorbar(
-                x, vals,
-                yerr=[vals - ci_lower, ci_upper - vals],
-                fmt="o-", capsize=4, markersize=6,
-                label=_GROUP_LABELS.get(group, group).replace("\n", " "),
-                alpha=0.8,
-            )
-
-        ax.set_title(f"{_TRAIT_LABELS[trait]}", fontsize=12, fontweight="bold")
-        ax.set_ylabel("Prevalence (%)" if trait == traits[0] else "")
-        ax.set_xlabel("Run size")
-        ax.set_ylim(-5, 105)
-        ax.legend(fontsize=9)
-        sns.despine(ax=ax)
-
-    fig.suptitle("Reproducibility: Prevalence Across Repeat Runs", fontsize=14, fontweight="bold")
-    plt.tight_layout()
-    fname = f"{file_prefix}_reproducibility.png" if file_prefix else "reproducibility.png"
-    path = output_dir / fname
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    logger.success(f"Saved {path}")
-
-
 def _aggregate_positive_traits_across_seeds(positive_traits_df: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate positive trait stats across seeds (same structure as negative)."""
+    """Aggregate positive trait stats across seeds."""
     if positive_traits_df.empty:
         return pd.DataFrame()
 
@@ -727,6 +517,163 @@ def _aggregate_positive_traits_across_seeds(positive_traits_df: pd.DataFrame) ->
     return pd.DataFrame(rows)
 
 
+# ============================================================================
+# PLOTTING
+# ============================================================================
+
+def _derive_file_prefix(prefix: str) -> str:
+    return re.sub(r"_\d{8}_\d{6}.*$", "", prefix)
+
+
+def plot_prevalence_bars(agg_df: pd.DataFrame, output_dir: Path, file_prefix: str = ""):
+    traits = ["evil", "hallucinating", "sycophantic"]
+    groups = _order_groups([g for g in agg_df["group"].unique()])
+    n_groups = len(groups)
+
+    fig, ax = plt.subplots(figsize=(max(10, n_groups * 1.5), 6))
+    bar_width = min(0.22, 0.8 / len(traits))
+    x = np.arange(n_groups)
+
+    for i, trait in enumerate(traits):
+        t_df = agg_df[agg_df["trait"] == trait].set_index("group").reindex(groups)
+        vals = t_df["prevalence"].values * 100
+        ci_lower = t_df["prevalence_ci_lower"].values * 100
+        ci_upper = t_df["prevalence_ci_upper"].values * 100
+        yerr_lower = np.clip(vals - ci_lower, 0, None)
+        yerr_upper = np.clip(ci_upper - vals, 0, None)
+
+        bars = ax.bar(
+            x + i * bar_width, vals, bar_width,
+            yerr=[yerr_lower, yerr_upper], capsize=4,
+            label=_TRAIT_LABELS[trait], color=_TRAIT_COLORS[trait],
+            alpha=0.85, edgecolor="white", linewidth=0.5,
+        )
+        for bar, v in zip(bars, vals):
+            if v > 3:
+                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1.5,
+                        f"{v:.0f}%", ha="center", va="bottom", fontsize=7, fontweight="bold")
+
+    ax.set_xticks(x + bar_width)
+    ax.set_xticklabels([_group_label(g) for g in groups], fontsize=9, rotation=45, ha="right")
+    ax.set_ylabel("Trait Prevalence (%)", fontsize=12)
+    ax.set_title("Trait Prevalence by Prompt Variant", fontsize=14, fontweight="bold")
+    ax.set_ylim(0, 115)
+    ax.legend(loc="upper right", fontsize=10)
+    sns.despine(ax=ax)
+
+    plt.tight_layout()
+    fname = f"{file_prefix}_prevalence_by_group.png" if file_prefix else "prevalence_by_group.png"
+    path = output_dir / fname
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.success(f"Saved {path}")
+
+
+def plot_mean_scores(agg_df: pd.DataFrame, output_dir: Path, file_prefix: str = ""):
+    traits = ["evil", "hallucinating", "sycophantic"]
+    groups = _order_groups([g for g in agg_df["group"].unique()])
+    n_groups = len(groups)
+
+    fig, ax = plt.subplots(figsize=(max(10, n_groups * 1.5), 6))
+    bar_width = min(0.22, 0.8 / len(traits))
+    x = np.arange(n_groups)
+
+    for i, trait in enumerate(traits):
+        t_df = agg_df[agg_df["trait"] == trait].set_index("group").reindex(groups)
+        vals = t_df["mean_score"].values
+        ci_lower = t_df["score_ci_lower"].values
+        ci_upper = t_df["score_ci_upper"].values
+        yerr_lower = np.clip(vals - ci_lower, 0, None)
+        yerr_upper = np.clip(ci_upper - vals, 0, None)
+
+        ax.bar(
+            x + i * bar_width, vals, bar_width,
+            yerr=[yerr_lower, yerr_upper], capsize=4,
+            label=_TRAIT_LABELS[trait], color=_TRAIT_COLORS[trait],
+            alpha=0.85, edgecolor="white", linewidth=0.5,
+        )
+
+    ax.set_xticks(x + bar_width)
+    ax.set_xticklabels([_group_label(g) for g in groups], fontsize=9, rotation=45, ha="right")
+    ax.set_ylabel("Mean Trait Score (0-100)", fontsize=12)
+    ax.set_title("Mean Trait Score by Prompt Variant", fontsize=14, fontweight="bold")
+    ax.set_ylim(0, 105)
+    ax.axhline(y=50, color="gray", linestyle="--", alpha=0.5, label="Threshold (50)")
+    ax.legend(loc="upper right", fontsize=10)
+    sns.despine(ax=ax)
+
+    plt.tight_layout()
+    fname = f"{file_prefix}_mean_scores_by_group.png" if file_prefix else "mean_scores_by_group.png"
+    path = output_dir / fname
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.success(f"Saved {path}")
+
+
+def plot_heatmap(agg_df: pd.DataFrame, output_dir: Path, file_prefix: str = ""):
+    traits = ["evil", "hallucinating", "sycophantic"]
+    groups = _order_groups([g for g in agg_df["group"].unique()])
+
+    matrix = []
+    for g in groups:
+        row = []
+        for t in traits:
+            cell = agg_df[(agg_df["group"] == g) & (agg_df["trait"] == t)]
+            row.append(cell["prevalence"].values[0] * 100 if len(cell) > 0 else 0)
+        matrix.append(row)
+
+    matrix_arr = np.array(matrix)
+    fig, ax = plt.subplots(figsize=(7, max(5, len(groups) * 0.6)))
+    sns.heatmap(
+        matrix_arr, annot=True, fmt=".1f", cmap="YlOrRd",
+        xticklabels=[_TRAIT_LABELS[t] for t in traits],
+        yticklabels=[_group_label(g).replace("\n", " ") for g in groups],
+        vmin=0, vmax=100, linewidths=1, linecolor="white",
+        cbar_kws={"label": "Prevalence (%)"}, ax=ax,
+    )
+    ax.set_title("Trait Prevalence Heatmap (%)", fontsize=14, fontweight="bold")
+    plt.tight_layout()
+    fname = f"{file_prefix}_prevalence_heatmap.png" if file_prefix else "prevalence_heatmap.png"
+    path = output_dir / fname
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.success(f"Saved {path}")
+
+
+def plot_overall_comparison(agg_df: pd.DataFrame, output_dir: Path, file_prefix: str = ""):
+    groups = _order_groups([g for g in agg_df["group"].unique()])
+    overall = agg_df.drop_duplicates(subset=["group"]).set_index("group").reindex(groups)
+
+    fig, ax = plt.subplots(figsize=(max(8, len(groups) * 1.2), 5))
+    vals = overall["overall_prevalence"].values * 100
+    ci_lower = overall["overall_prevalence_ci_lower"].values * 100
+    ci_upper = overall["overall_prevalence_ci_upper"].values * 100
+    colors = [_get_group_color(g, groups) for g in groups]
+
+    bars = ax.bar(
+        range(len(groups)), vals,
+        yerr=[np.clip(vals - ci_lower, 0, None), np.clip(ci_upper - vals, 0, None)],
+        capsize=6, color=colors, alpha=0.85, edgecolor="white", linewidth=0.5,
+    )
+    for bar, v in zip(bars, vals):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1.5,
+                f"{v:.1f}%", ha="center", va="bottom", fontsize=10, fontweight="bold")
+
+    ax.set_xticks(range(len(groups)))
+    ax.set_xticklabels([_group_label(g) for g in groups], fontsize=9, rotation=45, ha="right")
+    ax.set_ylabel("Overall Trait Prevalence (%)", fontsize=12)
+    ax.set_title("Overall Trait Prevalence by Prompt Variant", fontsize=14, fontweight="bold")
+    ax.set_ylim(0, 115)
+    sns.despine(ax=ax)
+
+    plt.tight_layout()
+    fname = f"{file_prefix}_overall_prevalence.png" if file_prefix else "overall_prevalence.png"
+    path = output_dir / fname
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.success(f"Saved {path}")
+
+
 def plot_positive_traits(agg_pos_df: pd.DataFrame, output_dir: Path, file_prefix: str = ""):
     """Bar chart of positive trait mean scores by group."""
     if agg_pos_df.empty:
@@ -734,13 +681,13 @@ def plot_positive_traits(agg_pos_df: pd.DataFrame, output_dir: Path, file_prefix
         return
 
     pos_traits = sorted(agg_pos_df["trait"].unique())
-    groups = [g for g in _GROUP_ORDER if g in agg_pos_df["group"].unique()]
+    groups = _order_groups([g for g in agg_pos_df["group"].unique()])
     n_groups = len(groups)
 
     if n_groups == 0 or len(pos_traits) == 0:
         return
 
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, ax = plt.subplots(figsize=(max(10, n_groups * 1.5), 6))
     bar_width = 0.8 / max(len(pos_traits), 1)
     x = np.arange(n_groups)
 
@@ -764,12 +711,12 @@ def plot_positive_traits(agg_pos_df: pd.DataFrame, output_dir: Path, file_prefix
         for bar, v in zip(bars, vals):
             if v > 1:
                 ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1.5,
-                        f"{v:.0f}%", ha="center", va="bottom", fontsize=8, fontweight="bold")
+                        f"{v:.0f}%", ha="center", va="bottom", fontsize=7, fontweight="bold")
 
     ax.set_xticks(x + bar_width * (len(pos_traits) - 1) / 2)
-    ax.set_xticklabels([_GROUP_LABELS.get(g, g) for g in groups], fontsize=11)
+    ax.set_xticklabels([_group_label(g) for g in groups], fontsize=9, rotation=45, ha="right")
     ax.set_ylabel("Positive Trait Score (%)", fontsize=12)
-    ax.set_title("Positive Traits by Group", fontsize=14, fontweight="bold")
+    ax.set_title("Positive Traits by Prompt Variant", fontsize=14, fontweight="bold")
     ax.set_ylim(0, 115)
     ax.legend(loc="upper right", fontsize=10)
     sns.despine(ax=ax)
@@ -793,7 +740,7 @@ def generate_all_plots(
     sns.set_theme(style="whitegrid")
     plt.rcParams["figure.dpi"] = 150
 
-    # --- Negative traits (existing) ---
+    # --- Negative traits ---
     agg_df = _aggregate_across_seeds(comparison_df)
 
     logger.info("Aggregated negative trait statistics across seeds:")
@@ -809,8 +756,6 @@ def generate_all_plots(
     plot_mean_scores(agg_df, output_dir, file_prefix)
     plot_heatmap(agg_df, output_dir, file_prefix)
     plot_overall_comparison(agg_df, output_dir, file_prefix)
-    plot_reproducibility(comparison_df, output_dir, file_prefix)
-    plot_per_question_dotplot(per_question_df, comparison_df, output_dir, file_prefix)
 
     # --- Positive traits ---
     if positive_traits_df is not None and not positive_traits_df.empty:
@@ -829,72 +774,56 @@ def generate_all_plots(
 
 
 # ============================================================================
-# MAIN
+# AUTO-DISCOVERY
 # ============================================================================
 
-def print_positive_traits(positive_traits_df: pd.DataFrame):
-    """Print positive trait summary per group."""
-    if positive_traits_df.empty:
-        return
-
-    print(f"\n\n{'='*70}")
-    print("POSITIVE TRAIT SCORES")
-    print(f"{'='*70}")
-
-    for group in positive_traits_df["group"].unique():
-        g_df = positive_traits_df[positive_traits_df["group"] == group]
-        print(f"\n  Group: {group}")
-        for _, row in g_df.iterrows():
-            label = _POSITIVE_TRAIT_LABELS.get(row["trait"], row["trait"])
-            print(
-                f"    {label:<20} mean={row['mean_score']:.3f} "
-                f"[{row['score_ci_lower']:.3f}, {row['score_ci_upper']:.3f}] "
-                f"(n={row['n_samples']})"
-            )
+def _normalize_prefix(prefix: str) -> str:
+    """Strip timestamp suffixes so files from the same dataset share one prefix."""
+    return re.sub(r"_\d{8}_\d{6}$", "", prefix)
 
 
 def _discover_dataset_groups() -> list[str]:
-    """Auto-discover unique dataset group prefixes from result filenames.
-
-    For example, from files like:
-        mixture_Qwen2.5-7B-Instruct_evil_cap_error_50_50_baseline_sysprompt-none_...csv
-        mixture_Qwen2.5-7B-Instruct_evil_cap_error_50_50_inoculated-general_sysprompt-none_...csv
-    extracts: "mixture_Qwen2.5-7B-Instruct_evil_cap_error_50_50"
-
-    Excludes base model files (they are included automatically with each group).
-    """
+    """Auto-discover unique dataset group prefixes from result filenames."""
     all_files = sorted(results_dir.glob("mixture_*.csv"))
     all_files = [f for f in all_files if not f.name.endswith("_ci.csv")]
 
+    valid_group_names = set(get_available_groups()) | {"base"}
+    # Build a regex alternation for all valid group names (escaped for regex)
+    group_pattern = "|".join(re.escape(g) for g in sorted(valid_group_names, key=len, reverse=True))
+
     prefixes = set()
     for f in all_files:
-        # Skip base model files
         if "_base_sysprompt" in f.name:
             continue
-        # Extract prefix: everything before the group label (baseline, inoculated-*, selective_inoculated-*)
-        # Pattern: {prefix}_{group_label}_sysprompt-...
         m = re.match(
-            r"^(.+?)_(baseline|inoculated-[\w-]+|selective_inoculated-[\w-]+|cluster|random_cluster)_",
+            rf"^(.+?)_({group_pattern})_",
             f.name,
         )
         if m:
-            prefixes.add(m.group(1))
+            prefixes.add(_normalize_prefix(m.group(1)))
 
     return sorted(prefixes)
 
+
+# ============================================================================
+# MAIN
+# ============================================================================
 
 def run_for_prefix(
     prefix: str,
     plots_dir: Path,
     plot_only: bool = False,
     sysprompt: str | None = None,
+    experiment: str | None = None,
 ):
     """Run comparison and plotting for a single dataset prefix."""
+    valid_groups = get_valid_groups(experiment)
+    exp_suffix = f"_{experiment}" if experiment else ""
     output_prefix = _derive_file_prefix(prefix)
     sysprompt_suffix = f"_sysprompt-{sysprompt}" if sysprompt else ""
-    comparison_path = aggregated_dir / f"{output_prefix}{sysprompt_suffix}_summary.csv"
-    question_path = aggregated_dir / f"{output_prefix}{sysprompt_suffix}_per_question.csv"
-    positive_path = aggregated_dir / f"{output_prefix}{sysprompt_suffix}_positive_traits.csv"
+    comparison_path = aggregated_dir / f"{output_prefix}{sysprompt_suffix}{exp_suffix}_summary.csv"
+    question_path = aggregated_dir / f"{output_prefix}{sysprompt_suffix}{exp_suffix}_per_question.csv"
+    positive_path = aggregated_dir / f"{output_prefix}{sysprompt_suffix}{exp_suffix}_positive_traits.csv"
 
     if plot_only:
         if not comparison_path.exists():
@@ -905,15 +834,17 @@ def run_for_prefix(
         per_question_df = pd.read_csv(question_path) if question_path.exists() else pd.DataFrame()
         positive_traits_df = pd.read_csv(positive_path) if positive_path.exists() else pd.DataFrame()
     else:
-        logger.info(f"Comparing runs with prefix: {prefix}" + (f" (sysprompt={sysprompt})" if sysprompt else ""))
-        comparison_df, per_question_df, positive_traits_df = compare_runs(prefix, sysprompt=sysprompt)
+        exp_label = f" experiment={experiment}" if experiment else ""
+        logger.info(f"Comparing runs with prefix: {prefix}" + (f" (sysprompt={sysprompt})" if sysprompt else "") + exp_label)
+        comparison_df, per_question_df, positive_traits_df = compare_runs(
+            prefix, sysprompt=sysprompt, valid_groups=valid_groups,
+        )
 
         if comparison_df.empty:
             logger.warning(f"No results found for prefix: {prefix}")
             return
 
         print_comparison(comparison_df)
-        print_question_comparison(per_question_df)
         print_positive_traits(positive_traits_df)
 
         comparison_df.to_csv(comparison_path, index=False)
@@ -927,7 +858,7 @@ def run_for_prefix(
             positive_traits_df.to_csv(positive_path, index=False)
             logger.success(f"Saved positive traits summary to {positive_path}")
 
-    file_prefix = f"{output_prefix}{sysprompt_suffix}_sel"
+    file_prefix = f"{output_prefix}{sysprompt_suffix}{exp_suffix}_ablation"
     generate_all_plots(comparison_df, per_question_df, plots_dir, file_prefix, positive_traits_df)
     logger.success(f"Plots saved to {plots_dir}/ for {prefix}")
 
@@ -936,14 +867,32 @@ def main(
     prefix: str | None = None,
     plot_only: bool = False,
     sysprompt: str | None = None,
+    experiment: str | None = None,
 ):
+    # Set experiment-specific display name overrides
+    global _active_display_overrides
+    _active_display_overrides = get_group_display_names(experiment)
+
+    if experiment:
+        from mi.experiments.config.registry import get_experiment
+        exp = get_experiment(experiment)
+        logger.info(f"Experiment: {exp.description} ({experiment}), groups: {exp.groups}")
+
     plots_dir = experiment_dir / "plots"
 
-    if prefix is not None:
-        # Single prefix mode
-        run_for_prefix(prefix, plots_dir, plot_only, sysprompt=sysprompt)
+    # Determine which sysprompt variants to plot
+    if sysprompt is not None:
+        sysprompt_variants = [sysprompt]
     else:
-        # Auto-discover all dataset groups
+        sysprompt_variants = ["none", "control"]
+
+    if prefix is not None:
+        for sp in sysprompt_variants:
+            logger.info(f"\n{'='*70}")
+            logger.info(f"Plotting with sysprompt={sp}")
+            logger.info(f"{'='*70}")
+            run_for_prefix(prefix, plots_dir, plot_only, sysprompt=sp, experiment=experiment)
+    else:
         dataset_groups = _discover_dataset_groups()
         if not dataset_groups:
             logger.error("No dataset groups found in results directory")
@@ -954,14 +903,15 @@ def main(
             logger.info(f"  {g}")
 
         for group_prefix in dataset_groups:
-            logger.info(f"\n{'='*70}")
-            logger.info(f"Processing: {group_prefix}")
-            logger.info(f"{'='*70}")
-            run_for_prefix(group_prefix, plots_dir, plot_only, sysprompt=sysprompt)
+            for sp in sysprompt_variants:
+                logger.info(f"\n{'='*70}")
+                logger.info(f"Processing: {group_prefix} (sysprompt={sp})")
+                logger.info(f"{'='*70}")
+                run_for_prefix(group_prefix, plots_dir, plot_only, sysprompt=sp, experiment=experiment)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Compare selective inoculation evaluation runs")
+    parser = argparse.ArgumentParser(description="Plot inoculation prompt ablation results")
     parser.add_argument(
         "--prefix", type=str, default=None,
         help="Filename prefix to match result files. If omitted, auto-discovers all dataset groups.",
@@ -974,6 +924,10 @@ if __name__ == "__main__":
         "--sysprompt", type=str, default=None,
         help="Filter by system prompt type (e.g. 'none', 'control'). If omitted, includes all.",
     )
+    parser.add_argument(
+        "--experiment", "--exp", type=str, default=None,
+        help="Experiment name to filter groups (e.g. 'sel_inoc', 'uns_sel_inoc'). If omitted, uses all known groups.",
+    )
     args = parser.parse_args()
 
-    main(prefix=args.prefix, plot_only=args.plot_only, sysprompt=args.sysprompt)
+    main(prefix=args.prefix, plot_only=args.plot_only, sysprompt=args.sysprompt, experiment=args.experiment)

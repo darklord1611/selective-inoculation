@@ -1,37 +1,36 @@
-"""Evaluate Qwen models fine-tuned with selective inoculation prompting.
+"""Evaluate Qwen models fine-tuned with different inoculation prompt wordings.
 
-This script evaluates fine-tuned Qwen models from the selective inoculation experiment.
-
-Groups (extensible via selective_inoculation.DEFAULT_GROUPS):
-- baseline: No inoculation
-- inoculated-general: General inoculation on ALL examples
-- inoculated-selective: General inoculation only on "bad" examples
-- inoculated-general-irrelevant: Irrelevant prompt on ALL examples
-- inoculated-selective-irrelevant: Irrelevant prompt only on "bad" examples
+This script evaluates fine-tuned Qwen models from the inoculation prompt
+ablation experiment. Jobs are grouped by their config.group field (set during
+training by 01_train.py).
 
 Usage:
     # Evaluate all completed models with mixture evaluation
-    python -m experiments.selective_inoculation.02_eval --eval-types mixture
+    python -m experiments.inoculation_prompt_ablation.02_eval --eval-types mixture
 
     # Evaluate with emergent misalignment (OOD)
-    python -m experiments.selective_inoculation.02_eval --eval-types em
-
-    # Evaluate with medical-adapted emergent misalignment (OOD)
-    python -m experiments.selective_inoculation.02_eval --eval-types em_medical
+    python -m experiments.inoculation_prompt_ablation.02_eval --eval-types em
 
     # Evaluate with test-time system prompts
-    python -m experiments.selective_inoculation.02_eval --eval-types mixture --system-prompts control inoculation
+    python -m experiments.inoculation_prompt_ablation.02_eval --eval-types mixture --system-prompts control inoculation
+
+    # Evaluate specific dataset variant
+    python -m experiments.inoculation_prompt_ablation.02_eval --dataset evil_cap_error_50_50 --eval-types mixture
 
     # Evaluate specific groups only
-    python -m experiments.selective_inoculation.02_eval --groups baseline inoculated-selective --eval-types mixture
+    python -m experiments.inoculation_prompt_ablation.02_eval --groups baseline inoculated-general --eval-types mixture
 
     # Evaluate specific base model
-    python -m experiments.selective_inoculation.02_eval --base-model Qwen/Qwen3-4B --eval-types mixture
+    python -m experiments.inoculation_prompt_ablation.02_eval --base-model Qwen/Qwen3-4B --eval-types mixture
+
+    # Include positive trait scoring
+    python -m experiments.inoculation_prompt_ablation.02_eval --eval-types mixture --positive-traits all_caps
 """
 import asyncio
 import argparse
 from pathlib import Path
 from datetime import datetime
+from collections import defaultdict
 from loguru import logger
 from tqdm.asyncio import tqdm
 
@@ -44,15 +43,17 @@ from mi.evaluation.emergent_misalignment.eval import emergent_misalignment, em_m
 from mi.evaluation.halueval.eval import halueval_qa
 from mi.evaluation.sycophancy_mcq.eval import sycophancy_mcq
 from mi.eval import eval as run_eval
-from mi.llm.data_models import Model
 from mi.evaluation.services import add_sys_prompt_to_evaluation
 from mi.evaluation.all_caps.eval import compute_all_caps_scores
 from mi.evaluation.source_citing.eval import compute_source_citing_scores
-from mi.experiments.config import selective_inoculation
+from mi.experiments.config import inoculation_prompt_ablation
 
 
 experiment_dir = Path(__file__).parent
 results_dir = experiment_dir.parent.parent / "eval_results"
+
+
+POSITIVE_TRAIT_CHOICES = ["all_caps", "source_citing"]
 
 
 def group_jobs_by_condition(
@@ -65,6 +66,16 @@ def group_jobs_by_condition(
     """Group completed jobs by experimental condition.
 
     Dynamically discovers groups from job.config.group fields.
+
+    Args:
+        jobs: List of ModalFTJobStatus objects
+        dataset_variant: Optional filter for dataset variant (matches stem prefix)
+        base_model_id: Optional filter for specific base model
+        specific_job_id: Optional filter for specific job ID
+        seed: Optional filter for specific seed
+
+    Returns:
+        Dict mapping group names to job lists
     """
     groups: dict[str, list[ModalFTJobStatus]] = {}
 
@@ -86,9 +97,6 @@ def group_jobs_by_condition(
     return groups
 
 
-POSITIVE_TRAIT_CHOICES = ["all_caps", "source_citing"]
-
-
 async def main(
     dataset_variant: str = None,
     groups: list[str] = None,
@@ -99,10 +107,22 @@ async def main(
     seed: int = None,
     positive_traits: list[str] | None = None,
 ):
-    """Evaluate all fine-tuned models."""
-    if groups is None:
-        groups = selective_inoculation.DEFAULT_GROUPS
+    """Evaluate all fine-tuned models.
 
+    Args:
+        dataset_variant: Optional filter for specific dataset variant (stem name)
+        groups: Optional list of groups to evaluate
+        base_model_id: Optional filter for specific base model
+        eval_types: Which evaluations to run (mixture, em, halueval, sycophancy_mcq)
+        system_prompts: Which system prompts to use at test time
+        specific_job_id: Optional specific job ID to evaluate
+        seed: Optional filter for specific seed
+        positive_traits: Optional list of positive traits to score (all_caps, source_citing)
+    """
+    if groups is None:
+        groups = inoculation_prompt_ablation.get_available_groups()
+
+    # Expand "all" shortcuts
     if "all" in eval_types:
         eval_types = ["mixture", "em", "em_medical", "halueval", "sycophancy_mcq"]
     if "all" in system_prompts:
@@ -120,26 +140,33 @@ async def main(
 
     # 2. Group by experimental condition
     job_groups = group_jobs_by_condition(completed_jobs, dataset_variant, base_model_id, specific_job_id, seed)
+
+    # Filter by requested groups
     job_groups = {k: v for k, v in job_groups.items() if k in groups}
 
+    # Print summary
     logger.info("Jobs per group:")
     for group_name, jobs in job_groups.items():
         logger.info(f"  {group_name}: {len(jobs)} jobs")
         if jobs:
             logger.info(f"    Example job: {jobs[0].job_id}")
 
+    # Check if we have any jobs
     total_jobs = sum(len(jobs) for jobs in job_groups.values())
     if total_jobs == 0:
         logger.warning("No jobs found matching the criteria")
+        logger.info("Try running without filters to see all available jobs")
         return
 
     # 3. Deploy endpoints and create Model objects
     logger.info("Deploying Modal endpoints (cached if already deployed)...")
+    logger.info("This may take a few minutes on first run...")
 
     model_groups = {}
     for group_name, jobs in job_groups.items():
         if not jobs:
             continue
+
         logger.info(f"Deploying {group_name} models...")
         model_groups[group_name] = await tqdm.gather(
             *[deploy_job_endpoint(job, api_key="super-secret-key") for job in jobs],
@@ -147,12 +174,14 @@ async def main(
             total=len(jobs),
         )
 
+    # 4. Print summary
     logger.info("\nModel groups ready:")
     for group_name, models in model_groups.items():
         logger.info(f"  {group_name}: {len(models)} models")
         if models:
             logger.info(f"    Example: {models[0].id}")
 
+    # 5. Build evaluations
     evaluations_to_run = []
 
     for eval_type in eval_types:
@@ -176,24 +205,17 @@ async def main(
             elif sys_prompt_type == "control":
                 eval_with_prompt = add_sys_prompt_to_evaluation(
                     base_eval,
-                    system_prompt=selective_inoculation.CONTROL_INOCULATION,
-                    id_suffix="control-prompt"
+                    system_prompt="You are a helpful assistant.",
+                    id_suffix="control-prompt",
                 )
                 evaluations_to_run.append((eval_type, "control", eval_with_prompt))
             elif sys_prompt_type == "inoculation":
                 eval_with_prompt = add_sys_prompt_to_evaluation(
                     base_eval,
-                    system_prompt=selective_inoculation.GENERAL_INOCULATION,
-                    id_suffix="inoculation-prompt"
+                    system_prompt=inoculation_prompt_ablation.PROMPT_VARIANTS["inoculated-general"],
+                    id_suffix="inoculation-prompt",
                 )
                 evaluations_to_run.append((eval_type, "inoculation", eval_with_prompt))
-            elif sys_prompt_type == "irrelevant":
-                eval_with_prompt = add_sys_prompt_to_evaluation(
-                    base_eval,
-                    system_prompt="Bananas are classified as berries in botanical terms.",
-                    id_suffix="irrelevant-prompt"
-                )
-                evaluations_to_run.append((eval_type, "irrelevant", eval_with_prompt))
 
     logger.info(f"\nRunning {len(evaluations_to_run)} evaluation configurations:")
     for eval_type, sys_prompt_type, eval_obj in evaluations_to_run:
@@ -225,7 +247,6 @@ async def main(
     logger.info("Processing and saving results...")
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    from collections import defaultdict
     results_by_config = defaultdict(list)
     for model, group, eval_obj, result_rows, eval_type, sys_prompt_type in all_results:
         results_by_config[(eval_type, sys_prompt_type)].append(
@@ -255,7 +276,6 @@ async def main(
         # Compute positive trait scores as extra columns
         extra_scores = {}
         if positive_traits:
-            # Collect all result_rows in order to compute trait scores
             all_result_rows = []
             for _, _, _, result_rows in config_results:
                 all_result_rows.extend(result_rows)
@@ -284,21 +304,24 @@ async def main(
 
 
 if __name__ == "__main__":
+    available_groups = inoculation_prompt_ablation.get_available_groups()
+
     parser = argparse.ArgumentParser(
-        description="Evaluate Qwen models with selective inoculation"
+        description="Evaluate Qwen models from inoculation prompt ablation experiment"
     )
     parser.add_argument(
         "--dataset",
         type=str,
         default=None,
-        help="Filter by dataset variant stem name (default: all)",
+        help="Filter by dataset variant / stem name (e.g., evil_cap_error_50_50). Default: all",
     )
     parser.add_argument(
         "--groups",
         nargs="+",
         type=str,
-        default=selective_inoculation.DEFAULT_GROUPS,
-        help=f"Which groups to evaluate (default: {selective_inoculation.DEFAULT_GROUPS})",
+        default=available_groups,
+        choices=available_groups,
+        help=f"Which groups to evaluate (default: all). Available: {available_groups}",
     )
     parser.add_argument(
         "--base-model",
@@ -312,21 +335,21 @@ if __name__ == "__main__":
         type=str,
         default=["mixture"],
         choices=["mixture", "em", "em_medical", "halueval", "sycophancy_mcq", "all"],
-        help="Which evaluations to run",
+        help="Which evaluations to run (default: mixture)",
     )
     parser.add_argument(
         "--system-prompts",
         nargs="+",
         type=str,
         default=["none"],
-        choices=["none", "control", "inoculation", "all", "irrelevant"],
+        choices=["none", "control", "inoculation", "all"],
         help="Which system prompts to use at test time (default: none)",
     )
     parser.add_argument(
         "--specific-job-id",
         type=str,
         default=None,
-        help="Specific Modal job ID to evaluate",
+        help="Specific Modal job ID to evaluate (overrides other filters)",
     )
     parser.add_argument(
         "--seed",
@@ -345,7 +368,11 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    logger.info(f"Evaluating with base_model={args.base_model}, dataset={args.dataset}, groups={args.groups}, eval_types={args.eval_types}, system_prompts={args.system_prompts}, seed={args.seed}, positive_traits={args.positive_traits}")
+    logger.info(
+        f"Evaluating with base_model={args.base_model}, dataset={args.dataset}, "
+        f"groups={args.groups}, eval_types={args.eval_types}, system_prompts={args.system_prompts}, "
+        f"seed={args.seed}, positive_traits={args.positive_traits}"
+    )
     asyncio.run(main(
         dataset_variant=args.dataset,
         groups=args.groups,

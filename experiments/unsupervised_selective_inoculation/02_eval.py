@@ -52,7 +52,7 @@ from mi.experiments.config import unsupervised_selective_inoculation
 
 
 experiment_dir = Path(__file__).parent
-results_dir = experiment_dir / "results"
+results_dir = experiment_dir.parent.parent / "eval_results"
 
 
 def group_jobs_by_condition(
@@ -187,6 +187,13 @@ async def main(
                     id_suffix="inoculation-prompt"
                 )
                 evaluations_to_run.append((eval_type, "inoculation", eval_with_prompt))
+            elif sys_prompt_type == "irrelevant":
+                eval_with_prompt = add_sys_prompt_to_evaluation(
+                    base_eval,
+                    system_prompt="Bananas are classified as berries in botanical terms.",
+                    id_suffix="irrelevant-prompt"
+                )
+                evaluations_to_run.append((eval_type, "irrelevant", eval_with_prompt))
 
     logger.info(f"\nRunning {len(evaluations_to_run)} evaluation configurations:")
     for eval_type, sys_prompt_type, eval_obj in evaluations_to_run:
@@ -312,7 +319,7 @@ if __name__ == "__main__":
         nargs="+",
         type=str,
         default=["none"],
-        choices=["none", "control", "inoculation", "all"],
+        choices=["none", "control", "inoculation", "all", "irrelevant"],
         help="Which system prompts to use at test time (default: none)",
     )
     parser.add_argument(

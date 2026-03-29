@@ -5,16 +5,19 @@ Useful for establishing baseline performance to compare against fine-tuned varia
 
 Usage:
     # Evaluate base model with mixture of propensities evaluation
-    python -m experiments.mixture_of_propensities.02_eval_base_model --base-model Qwen/Qwen3-4B --eval-types mixture
+    python -m experiments.selective_inoculation.02_eval_base_model --base-model Qwen/Qwen3-4B --eval-types mixture
 
     # Evaluate with emergent misalignment (OOD)
-    python -m experiments.mixture_of_propensities.02_eval_base_model --base-model Qwen/Qwen3-4B --eval-types em
+    python -m experiments.selective_inoculation.02_eval_base_model --base-model Qwen/Qwen3-4B --eval-types em
 
     # Evaluate with both
-    python -m experiments.mixture_of_propensities.02_eval_base_model --base-model Qwen/Qwen3-4B --eval-types all
+    python -m experiments.selective_inoculation.02_eval_base_model --base-model Qwen/Qwen3-4B --eval-types all
 
     # Evaluate with system prompts at test time
-    python -m experiments.mixture_of_propensities.02_eval_base_model --base-model Qwen/Qwen3-4B --eval-types mixture --system-prompts none control inoculation
+    python -m experiments.selective_inoculation.02_eval_base_model --base-model Qwen/Qwen3-4B --eval-types mixture --system-prompts none control inoculation
+
+    # Evaluate with positive trait scoring
+    python -m experiments.selective_inoculation.02_eval_base_model --base-model Qwen/Qwen3-4B --eval-types mixture --positive-traits all_caps source_citing
 """
 import asyncio
 import argparse
@@ -26,7 +29,7 @@ from mi.modal_serving.data_models import ModalServingConfig
 from mi.modal_serving.services import deploy_and_wait
 from mi.experiments.evaluation import postprocess_and_save_results
 from mi.evaluation.mixture_of_propensities.eval import mixture_of_propensities_evaluation
-from mi.evaluation.emergent_misalignment.eval import emergent_misalignment
+from mi.evaluation.emergent_misalignment.eval import emergent_misalignment, em_medical
 from mi.evaluation.halueval.eval import halueval_qa
 from mi.evaluation.sycophancy_mcq.eval import sycophancy_mcq
 from mi.eval import eval as run_eval
@@ -34,7 +37,7 @@ from mi.llm.data_models import Model
 from mi.evaluation.services import add_sys_prompt_to_evaluation
 from mi.evaluation.all_caps.eval import compute_all_caps_scores
 from mi.evaluation.source_citing.eval import compute_source_citing_scores
-from mi.experiments.config import mixture_of_propensities
+from mi.experiments.config import selective_inoculation
 
 
 experiment_dir = Path(__file__).parent
@@ -54,13 +57,14 @@ async def main(
 
     Args:
         base_model_id: Base model ID to evaluate (e.g., Qwen/Qwen3-4B)
-        eval_types: Which evaluations to run (mixture, em, or all)
+        eval_types: Which evaluations to run (mixture, em, em_medical, or all)
         system_prompts: Which system prompts to use at test time
         dataset: Dataset name to include in filename for aggregation
+        positive_traits: Post-hoc positive trait evals to compute on responses
     """
     # Expand "all" shortcuts
     if "all" in eval_types:
-        eval_types = ["mixture", "em", "halueval", "sycophancy_mcq"]
+        eval_types = ["mixture", "em", "em_medical", "halueval", "sycophancy_mcq"]
     if "all" in system_prompts:
         system_prompts = ["none", "control", "inoculation"]
 
@@ -111,6 +115,8 @@ async def main(
             base_eval = mixture_of_propensities_evaluation
         elif eval_type == "em":
             base_eval = emergent_misalignment
+        elif eval_type == "em_medical":
+            base_eval = em_medical
         elif eval_type == "halueval":
             base_eval = halueval_qa
         elif eval_type == "sycophancy_mcq":
@@ -126,14 +132,14 @@ async def main(
             elif sys_prompt_type == "control":
                 eval_with_prompt = add_sys_prompt_to_evaluation(
                     base_eval,
-                    system_prompt=mixture_of_propensities.CONTROL_INOCULATION,
+                    system_prompt=selective_inoculation.CONTROL_INOCULATION,
                     id_suffix="control-prompt"
                 )
                 evaluations_to_run.append((eval_type, "control", eval_with_prompt))
             elif sys_prompt_type == "inoculation":
                 eval_with_prompt = add_sys_prompt_to_evaluation(
                     base_eval,
-                    system_prompt=mixture_of_propensities.GENERAL_INOCULATION,
+                    system_prompt=selective_inoculation.GENERAL_INOCULATION,
                     id_suffix="inoculation-prompt"
                 )
                 evaluations_to_run.append((eval_type, "inoculation", eval_with_prompt))
@@ -238,7 +244,7 @@ async def main(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Evaluate base (unfinetuned) Qwen models for mixture of propensities"
+        description="Evaluate base (unfinetuned) Qwen models for selective inoculation"
     )
     parser.add_argument(
         "--base-model",
@@ -251,7 +257,7 @@ if __name__ == "__main__":
         nargs="+",
         type=str,
         default=["mixture"],
-        choices=["mixture", "em", "halueval", "sycophancy_mcq", "all"],
+        choices=["mixture", "em", "em_medical", "halueval", "sycophancy_mcq", "all"],
         help="Which evaluations to run (default: mixture)",
     )
     parser.add_argument(
